@@ -120,3 +120,18 @@ func (e Engine) AddRequestFinishListener(listener URLRequestFinishedInfoListener
 func (e Engine) RemoveRequestFinishListener(listener URLRequestFinishedInfoListener) {
 	C.Cronet_Engine_RemoveRequestFinishedListener(e.ptr, listener.ptr)
 }
+
+// SetTrustedRootCertificates sets custom trusted root certificates for this engine.
+// Must be called before StartWithParams().
+// pemRootCerts should be PEM-formatted certificates (can contain multiple certificates).
+// Returns true if the certificates were successfully set, false if parsing failed.
+func (e Engine) SetTrustedRootCertificates(pemRootCerts string) bool {
+	cPem := C.CString(pemRootCerts)
+	defer C.free(unsafe.Pointer(cPem))
+	certVerifier := C.Cronet_CreateCertVerifierWithRootCerts(cPem)
+	if certVerifier == nil {
+		return false
+	}
+	C.Cronet_Engine_SetMockCertVerifierForTesting(e.ptr, certVerifier)
+	return true
+}
