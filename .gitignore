@@ -4,3 +4,11 @@
 .DS_Store
 CLAUDE.md
 /.claude/
+
+# Prebuilt libraries (committed to go branch only)
+/lib/
+/include/
+/cgo_*.go
+
+# NaiveProxy build outputs
+/naiveproxy/src/out/
