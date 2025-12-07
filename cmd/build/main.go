@@ -13,9 +13,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -29,7 +26,7 @@ import (
 
 // Target represents a build target platform
 type Target struct {
-	OS   string // gn target_os: linux, mac, win, android
+	OS   string // gn target_os: linux, mac, win, android, ios
 	CPU  string // gn target_cpu: x64, arm64, x86, arm
 	GOOS string // Go GOOS
 	ARCH string // Go GOARCH
@@ -167,172 +164,78 @@ func cmdBuild(targets []Target) {
 	log("Build complete!")
 }
 
-// SysrootInfo contains information about a Linux sysroot
-type SysrootInfo struct {
-	Sha256Sum  string `json:"Sha256Sum"`
-	SysrootDir string `json:"SysrootDir"`
-	Tarball    string `json:"Tarball"`
-	URL        string `json:"URL"`
+// getExtraFlags returns the EXTRA_FLAGS for a target
+func getExtraFlags(t Target) string {
+	flags := []string{
+		fmt.Sprintf(`target_os="%s"`, t.OS),
+		fmt.Sprintf(`target_cpu="%s"`, t.CPU),
+	}
+	return strings.Join(flags, " ")
 }
 
-func ensureAndroidNDK() string {
-	ndkDir := filepath.Join(srcRoot, "third_party", "android_toolchain", "ndk")
+// runGetClang runs naiveproxy's get-clang.sh with appropriate EXTRA_FLAGS
+func runGetClang(t Target) {
+	// For cross-compilation on Linux, we need to also build host sysroot first
+	// because GN needs host sysroot in addition to target sysroot
+	hostOS := runtime.GOOS
+	hostCPU := hostToCPU(runtime.GOARCH)
+	if hostOS == "linux" && (t.OS == "linux" || t.OS == "android") && t.CPU != hostCPU {
+		// Run get-clang.sh with host target to ensure host sysroot is downloaded
+		hostFlags := fmt.Sprintf(`target_os="linux" target_cpu="%s"`, hostCPU)
+		log("Running get-clang.sh for host sysroot with EXTRA_FLAGS=%s", hostFlags)
+		cmd := exec.Command("bash", "./get-clang.sh")
+		cmd.Dir = srcRoot
+		cmd.Env = append(os.Environ(), "EXTRA_FLAGS="+hostFlags)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fatal("get-clang.sh (host) failed: %v", err)
+		}
 
-	// Check if already set up
-	if _, err := os.Stat(filepath.Join(ndkDir, "toolchains")); err == nil {
-		log("Android NDK already configured")
-		return ndkDir
-	}
-
-	// Check for local Android SDK NDK
-	homeDir, _ := os.UserHomeDir()
-	localSDK := filepath.Join(homeDir, "Library", "Android", "sdk")
-	localNDKBase := filepath.Join(localSDK, "ndk")
-
-	// Find r28 NDK (28.x.x)
-	var localNDK string
-	if entries, err := os.ReadDir(localNDKBase); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() && strings.HasPrefix(entry.Name(), "28.") {
-				localNDK = filepath.Join(localNDKBase, entry.Name())
-				break
+		// Create symlink for host sysroot so GN can find it at the default location
+		hostSysrootSrc := filepath.Join(srcRoot, "out/sysroot-build/bullseye/bullseye_amd64_staging")
+		hostSysrootDst := filepath.Join(srcRoot, "build/linux/debian_bullseye_amd64-sysroot")
+		if _, err := os.Stat(hostSysrootDst); os.IsNotExist(err) {
+			log("Creating symlink for host sysroot: %s -> %s", hostSysrootDst, hostSysrootSrc)
+			if err := os.Symlink(hostSysrootSrc, hostSysrootDst); err != nil {
+				fatal("failed to create host sysroot symlink: %v", err)
 			}
 		}
 	}
 
-	if localNDK == "" {
-		// Try to install via sdkmanager
-		sdkManager := filepath.Join(localSDK, "cmdline-tools", "latest", "bin", "sdkmanager")
-		if _, err := os.Stat(sdkManager); err == nil {
-			log("Installing Android NDK r28 via sdkmanager...")
-			runCmd(localSDK, sdkManager, "--install", "ndk;28.0.13004108")
-			localNDK = filepath.Join(localNDKBase, "28.0.13004108")
-		} else {
-			fatal("Android NDK r28 not found and sdkmanager not available. Please install NDK r28 via Android Studio.")
-		}
+	extraFlags := getExtraFlags(t)
+	log("Running get-clang.sh with EXTRA_FLAGS=%s", extraFlags)
+
+	cmd := exec.Command("bash", "./get-clang.sh")
+	cmd.Dir = srcRoot
+	cmd.Env = append(os.Environ(), "EXTRA_FLAGS="+extraFlags)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fatal("get-clang.sh failed: %v", err)
 	}
-
-	log("Using Android NDK from: %s", localNDK)
-
-	// Create directory structure
-	os.MkdirAll(filepath.Join(ndkDir, "sources", "android"), 0755)
-	os.MkdirAll(filepath.Join(ndkDir, "toolchains", "llvm"), 0755)
-
-	// Symlink cpufeatures
-	cpuFeatSrc := filepath.Join(localNDK, "sources", "android", "cpufeatures")
-	cpuFeatDst := filepath.Join(ndkDir, "sources", "android", "cpufeatures")
-	if _, err := os.Stat(cpuFeatDst); os.IsNotExist(err) {
-		os.Symlink(cpuFeatSrc, cpuFeatDst)
-	}
-
-	// Symlink prebuilt toolchain
-	prebuiltSrc := filepath.Join(localNDK, "toolchains", "llvm", "prebuilt")
-	prebuiltDst := filepath.Join(ndkDir, "toolchains", "llvm", "prebuilt")
-	if _, err := os.Stat(prebuiltDst); os.IsNotExist(err) {
-		os.Symlink(prebuiltSrc, prebuiltDst)
-	}
-
-	log("Android NDK configured at: %s", ndkDir)
-	return ndkDir
 }
 
-func ensureLinuxSysroot(arch string) string {
-	// Map CPU to sysroot arch
-	sysrootArch := map[string]string{
-		"x64":   "amd64",
-		"arm64": "arm64",
-		"x86":   "i386",
-		"arm":   "armhf",
-	}[arch]
-
-	if sysrootArch == "" {
-		fatal("unsupported Linux arch for sysroot: %s", arch)
+// hostToCPU converts Go GOARCH to GN cpu
+func hostToCPU(goarch string) string {
+	switch goarch {
+	case "amd64":
+		return "x64"
+	case "arm64":
+		return "arm64"
+	case "386":
+		return "x86"
+	case "arm":
+		return "arm"
+	default:
+		return goarch
 	}
-
-	sysrootKey := "bullseye_" + sysrootArch
-	sysrootDir := filepath.Join(srcRoot, "build", "linux", "debian_bullseye_"+sysrootArch+"-sysroot")
-
-	// Check if sysroot already exists
-	if _, err := os.Stat(sysrootDir); err == nil {
-		log("Sysroot already exists: %s", sysrootDir)
-		return sysrootDir
-	}
-
-	// Load sysroots.json
-	sysrootsFile := filepath.Join(srcRoot, "build", "linux", "sysroot_scripts", "sysroots.json")
-	data, err := os.ReadFile(sysrootsFile)
-	if err != nil {
-		fatal("failed to read sysroots.json: %v", err)
-	}
-
-	var sysroots map[string]SysrootInfo
-	if err := json.Unmarshal(data, &sysroots); err != nil {
-		fatal("failed to parse sysroots.json: %v", err)
-	}
-
-	info, ok := sysroots[sysrootKey]
-	if !ok {
-		fatal("sysroot not found in sysroots.json: %s", sysrootKey)
-	}
-
-	// Download sysroot (URL format is {URL}/{Sha256Sum})
-	url := info.URL + "/" + info.Sha256Sum
-	log("Downloading sysroot from %s...", url)
-
-	tarballPath := filepath.Join(srcRoot, "build", "linux", info.Tarball)
-	if err := downloadFile(url, tarballPath, info.Sha256Sum); err != nil {
-		fatal("failed to download sysroot: %v", err)
-	}
-
-	// Extract sysroot
-	log("Extracting sysroot...")
-	if err := os.MkdirAll(sysrootDir, 0755); err != nil {
-		fatal("failed to create sysroot directory: %v", err)
-	}
-
-	runCmd(filepath.Join(srcRoot, "build", "linux"), "tar", "-xf", info.Tarball, "-C", info.SysrootDir)
-
-	// Clean up tarball
-	os.Remove(tarballPath)
-
-	log("Sysroot installed: %s", sysrootDir)
-	return sysrootDir
-}
-
-func downloadFile(url, dest, expectedSha256 string) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
-	out, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	hash := sha256.New()
-	writer := io.MultiWriter(out, hash)
-
-	if _, err := io.Copy(writer, resp.Body); err != nil {
-		return err
-	}
-
-	actualSha256 := hex.EncodeToString(hash.Sum(nil))
-	if actualSha256 != expectedSha256 {
-		os.Remove(dest)
-		return fmt.Errorf("sha256 mismatch: expected %s, got %s", expectedSha256, actualSha256)
-	}
-
-	return nil
 }
 
 func buildTarget(t Target) {
+	// Run get-clang.sh to ensure toolchain is available
+	runGetClang(t)
+
 	outDir := fmt.Sprintf("out/cronet-%s-%s", t.OS, t.CPU)
 
 	// Prepare GN args
@@ -366,29 +269,26 @@ func buildTarget(t Target) {
 		"exclude_unwind_tables=true",
 		"enable_resource_allowlist_generation=false",
 		"symbol_level=0",
+		"enable_dsyms=false",
 		fmt.Sprintf("target_os=\"%s\"", t.OS),
 		fmt.Sprintf("target_cpu=\"%s\"", t.CPU),
 	}
-
-	// Always disable dsyms (even for host tools when cross-compiling)
-	args = append(args, "enable_dsyms=false")
 
 	// Platform-specific args
 	switch t.OS {
 	case "mac":
 		args = append(args, "use_sysroot=false")
 	case "linux":
-		// For Linux cross-compilation, we need a sysroot
-		sysrootDir := ensureLinuxSysroot(t.CPU)
-		relSysroot, _ := filepath.Rel(srcRoot, sysrootDir)
-		args = append(args, "use_sysroot=true", fmt.Sprintf("target_sysroot=\"//%s\"", relSysroot))
+		// Sysroot is handled by get-clang.sh, use the naiveproxy path
+		sysrootArch := map[string]string{"x64": "amd64", "arm64": "arm64"}[t.CPU]
+		sysrootDir := fmt.Sprintf("out/sysroot-build/bullseye/bullseye_%s_staging", sysrootArch)
+		args = append(args, "use_sysroot=true", fmt.Sprintf("target_sysroot=\"//%s\"", sysrootDir))
 		if t.CPU == "x64" {
 			args = append(args, "use_cfi_icall=false")
 		}
 	case "win":
 		args = append(args, "use_sysroot=false")
 	case "android":
-		ensureAndroidNDK()
 		args = append(args,
 			"use_sysroot=false",
 			"default_min_sdk_version=24",
@@ -406,11 +306,28 @@ func buildTarget(t Target) {
 
 	gnArgs := strings.Join(args, " ")
 
-	// Run gn gen
+	// Determine GN path
 	gnPath := filepath.Join(srcRoot, "gn", "out", "gn")
-	runCmd(srcRoot, gnPath, "gen", outDir, "--args="+gnArgs)
+	if runtime.GOOS == "windows" {
+		gnPath += ".exe"
+	}
+
+	// Run gn gen
+	log("Running: gn gen %s", outDir)
+	gnCmd := exec.Command(gnPath, "gen", outDir, "--args="+gnArgs)
+	gnCmd.Dir = srcRoot
+	gnCmd.Stdout = os.Stdout
+	gnCmd.Stderr = os.Stderr
+	// On Windows, use system Visual Studio instead of depot_tools
+	if runtime.GOOS == "windows" {
+		gnCmd.Env = append(os.Environ(), "DEPOT_TOOLS_WIN_TOOLCHAIN=0")
+	}
+	if err := gnCmd.Run(); err != nil {
+		fatal("gn gen failed: %v", err)
+	}
 
 	// Run ninja
+	log("Running: ninja -C %s cronet_static", outDir)
 	runCmd(srcRoot, "ninja", "-C", outDir, "cronet_static")
 }
 
